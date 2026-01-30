@@ -1,0 +1,17 @@
+apispec==6.9.0
+blinker==1.9.0
+click==8.3.1
+Flask==3.1.2
+flask-smorest==0.46.2
+Flask-SQLAlchemy==3.1.1
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+marshmallow==4.2.1
+marshmallow-sqlalchemy==1.4.2
+packaging==26.0
+python-dotenv==1.2.1
+SQLAlchemy==2.0.46
+typing_extensions==4.15.0
+webargs==8.7.1
+Werkzeug==3.1.5
