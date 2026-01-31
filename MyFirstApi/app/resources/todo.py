@@ -46,6 +46,8 @@ class TodoResource(MethodView):
     def get(self, todo_id):
         return TodoModel.query.get_or_404(todo_id)
 
+    @bp.arguments(TodoSchema)
+    @bp.response(200, TodoSchema)
     def put(self, data_toUpdate, todo_id):
         todo = TodoModel.query.get_or_404(todo_id)
         for key, value in data_toUpdate.items():
