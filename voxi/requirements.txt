@@ -1,0 +1,10 @@
+fastapi==0.109.0  # Backend framework
+uvicorn==0.24.0  # ASGI server to run the app
+python-dotenv==1.0.0  # For .env
+requests==2.31.0  # API calls
+pydantic==2.5.3  # Data models
+openai==1.10.0  # OpenAI SDK
+google-api-python-client==2.112.0  # For Google Calendar
+google-auth-oauthlib==1.2.0
+twilio==8.12.0  # For SMS
+# Add later: langchain==0.1.0 for agentic chains if needed
