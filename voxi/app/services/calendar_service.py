@@ -67,7 +67,7 @@ def check_calendar_availability(
 
     try:
         response = requests.get(
-            CAL_BASE_URL,
+            f"{CAL_BASE_URL}/v2/slots",
             params=params,
             headers=headers,
             timeout=timeout
@@ -102,3 +102,32 @@ def check_calendar_availability(
     except ValueError as e:
         # JSON decode error etc.
         return {"error": "invalid_response", "message": str(e)}
+
+
+def get_cal_com_booking_link(
+    date_str: str,
+    event_type_slug: str = DEFAULT_EVENT_SLUG,
+    username: str = CAL_USERNAME
+) -> str:
+    """
+    Generate a direct link to the Cal.com booking page for a specific date
+    and event type. The user can see available slots and book immediately.
+
+    Args:
+        date_str: Date in YYYY-MM-DD format
+        event_type_slug: Which meeting type (e.g. "30min", "coffee-chat-45")
+        username: Cal.com username (defaults to the one from env)
+
+    Returns:
+        Full booking URL string
+    """
+    return f"{CAL_BASE_URL}/{username}/{event_type_slug}?date={date_str}"
+
+
+# Optional: small test / example usage (only runs if file executed directly)
+if __name__ == "__main__":
+    print(get_cal_com_booking_link("2026-02-06"))
+    # → https://cal.com/pranav-chitrans-nunnxo/30min?date=2026-02-06
+
+    print(get_cal_com_booking_link("2026-02-10", "45min"))
+    # → https://cal.com/pranav-chitrans-nunnxo/45min?date=2026-02-10
