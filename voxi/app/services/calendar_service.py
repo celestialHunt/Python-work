@@ -10,7 +10,7 @@ load_dotenv()
 CAL_BASE_URL = os.getenv("CAL_BASE_URL")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE")
 DEFAULT_EVENT_SLUG = "30min"
-API_VERSION = "2024-09-04"
+CAL_API_VERSION = os.getenv("CAL_API_VERSION")
 
 CAL_API_KEY = os.getenv("CAL_API_KEY")
 if not CAL_API_KEY:
@@ -61,7 +61,7 @@ def check_calendar_availability(
 
     headers = {
         "Authorization": f"Bearer {CAL_API_KEY}",
-        "cal-api-version": API_VERSION,
+        "cal-api-version": CAL_API_VERSION,
         "Accept": "application/json",
     }
 
