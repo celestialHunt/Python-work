@@ -142,7 +142,7 @@ async def vapi_book_appointment(request: Request):
             "results": [{"toolCallId": tool_call_id, "result": result_string}]
         }
 
-    # Minimal payload — remove title & language
+    # Minimal payload
     payload = {
         "start": start_time,
         "eventTypeId": 4648515,
