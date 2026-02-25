@@ -1,10 +1,7 @@
 from fastapi import FastAPI
 from app.api import vapi_routes
 from dotenv import load_dotenv
-from app.services.calendar_service import (
-    check_calendar_availability,
-    get_cal_com_booking_link,
-)
+from app.services.calendar_service import (check_calendar_availability)
 import uvicorn
 
 load_dotenv()
@@ -20,10 +17,6 @@ async def root():
     return {"message": "Voxi Server is Live"}
 
 
-# ────────────────────────────────────────────────
-#     Add this endpoint so /availability/... works
-# ────────────────────────────────────────────────
-
 @app.get("/availability/{date}", include_in_schema=False)
 def availability(date: str):
     """
@@ -33,12 +26,12 @@ def availability(date: str):
         GET /availability/2026-02-11
     """
     avail = check_calendar_availability(date)
-    link = get_cal_com_booking_link(date)
+    # link = get_cal_com_booking_link(date)
 
     return {
         "date": date,
         "availability": avail,
-        "direct_booking_link": link
+        # "direct_booking_link": link
     }
 
 

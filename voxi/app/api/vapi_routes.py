@@ -2,25 +2,44 @@ from fastapi import APIRouter, Request
 from app.services.calendar_service import (
     check_calendar_availability,
     CAL_API_BASE_URL,
-    CAL_API_KEY,
     CAL_API_VERSION
 )
 import requests
 from datetime import datetime, timedelta
+from app.services.database_service import get_customer_by_phone
+from app.utils.vapi_utils import get_caller_number, clean_vapi_email
 
 router = APIRouter(prefix="/vapi", tags=["vapi"])
 
-HEADERS = {
-    "Authorization": f"Bearer {CAL_API_KEY}",
-    "cal-api-version": CAL_API_VERSION,
-    "Content-Type": "application/json"
-}
+
+@router.post("/inbound")
+async def handle_vapi_call(request: Request):
+    data = await request.json()
+    customer_number = get_caller_number(data)
+
+    if customer_number:
+        customer = get_customer_by_phone(customer_number)
+        if customer:
+            # Personalize the greeting using the DB record
+            business_name = customer.get('business_name', 'there')
+            return {
+                "assistant": {
+                    "firstMessage": (
+                        f"Hello {business_name}! "
+                        "How can I help with your calendar today?"
+                    )
+                }
+            }
+
+    # Fallback greeting if no customer is found
+    return {
+        "assistant": {"firstMessage": "Hello there! How can I help you today?"}
+    }
 
 
 @router.post("/check-availability")
 async def vapi_check_availability(request: Request):
     data = await request.json()
-
     # 1. Extract the Tool Call ID (Vapi MUST have this back)
     message = data.get("message", {})
     tool_calls = message.get("toolCalls", [])
@@ -34,8 +53,30 @@ async def vapi_check_availability(request: Request):
     arguments = tool_call.get("function", {}).get("arguments", {})
     date_str = arguments.get("date")
 
-    # 3. Call your working calendar service
-    avail = check_calendar_availability(date_str)
+    # 3. Now check the database
+    customer_number = get_caller_number(data)
+    customer = get_customer_by_phone(customer_number)
+    if not customer:
+        msg = (
+            "I'm sorry, I couldn't find your business record "
+            "to check the calendar."
+        )
+        return {
+            "results": [{
+                "toolCallId": tool_call_id,
+                "result": msg
+            }]
+        }
+
+    # 4. Call your working calendar service
+    # avail = check_calendar_availability(date_str)
+    avail = check_calendar_availability(
+        date_str=date_str,
+        api_key=customer.get("cal_api_key"),
+        username=customer.get("cal_username"),
+        event_type_slug=customer.get("event_type_slug", "30min"),
+        timezone=customer.get("timezone", "Asia/Kolkata")
+    )
 
     # 4. Format the result for Vapi
     if avail.get("status") == "success":
@@ -66,7 +107,6 @@ async def vapi_check_availability(request: Request):
             else:
                 result_string += "\nNo times available that day."
     else:
-        print(f"DEBUG: Availability failed with: {avail}")
         error_msg = avail.get("message", "Unknown error")
         result_string = (
             "Sorry, I couldn't check the calendar: "
@@ -96,98 +136,95 @@ async def vapi_book_appointment(request: Request):
     tool_call_id = tool_call.get("id")
     args = tool_call.get("function", {}).get("arguments", {})
 
-    print(f"BOOKING REQUEST RECEIVED: args = {args}")
-
+    # 1. Argument presence validation
     if not args or not isinstance(args, dict):
         result_string = (
-            "Sorry, I need name, email, and time to book."
+            "Sorry, I need name, email, and time to book. "
             "Can you provide them again?"
         )
         return {
-            "results": [
-                {
-                    "toolCallId": tool_call_id,
-                    "result": result_string
-                }
-            ]
+            "results":
+            [{"toolCallId": tool_call_id, "result": result_string}]
         }
 
-    # Email parsing — make it robust
-    raw_email = args.get("email", "").lower().strip()
-    print(f"see raw email value ::: {raw_email}")
-    email = (
-        raw_email.replace(" dot ", ".")
-        .replace("dot", ".")
-        .replace(" at ", "@")
-        .replace("attherate", "@")
-        .replace(" ", "")
-    )
+    # 2. Customer Lookup
+    customer_number = get_caller_number(data)
+    customer = get_customer_by_phone(customer_number)
 
-    print(f"Parsed email ::: {email}")
-    # Basic validation
+    # 3. Hard Stop if not in DB
+    if not customer:
+        msg = (
+            "I'm sorry, I cannot book because the business record "
+            "is missing."
+        )
+        return {"results": [{"toolCallId": tool_call_id, "result": msg}]}
+
+    # 4. Extract DB values (No .env fallbacks)
+    api_key = customer.get("cal_api_key")
+    tz = customer.get("timezone", "UTC")
+    # Safely convert event_id to integer
+    try:
+        event_id = int(customer.get("event_type_id"))
+    except (TypeError, ValueError):
+        msg = "Internal Error: Business calendar is not configured correctly."
+        return {"results": [{"toolCallId": tool_call_id, "result": msg}]}
+
+    # 5. Build Headers and Payload
+    booking_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "cal-api-version": CAL_API_VERSION,
+        "Content-Type": "application/json"
+    }
+
+    # 6. Email parsing & validation
+    raw_email = args.get("email", "")
+    email = clean_vapi_email(raw_email)
+
     if "@" not in email or "." not in email.split("@")[-1]:
         result_string = (
-            "Sorry, the email doesn't look valid."
+            "Sorry, the email doesn't look valid. "
             "Please provide a correct email."
         )
         return {
-            "results": [{"toolCallId": tool_call_id, "result": result_string}]
+            "results":
+            [{"toolCallId": tool_call_id, "result": result_string}]
         }
 
-    # Start time — assume Vapi sends ISO or "HH:MM AM/PM"
+    # 7. Start time validation
     start_time = args.get("time")
     if not start_time:
         result_string = "Sorry, I need a time to book the appointment."
         return {
-            "results": [{"toolCallId": tool_call_id, "result": result_string}]
+            "results":
+            [{"toolCallId": tool_call_id, "result": result_string}]
         }
 
-    # Minimal payload
     payload = {
         "start": start_time,
-        "eventTypeId": 4648515,
+        "eventTypeId": event_id,
         "attendee": {
             "name": args.get("name", "Guest"),
             "email": email,
-            "timeZone": "Asia/Kolkata"
+            "timeZone": tz
         },
         "metadata": {}
     }
 
-    print(f"BOOKING PAYLOAD: {payload}")
-    print(f"Headers: {HEADERS}")
+    # 8. Execution
     url = f"{CAL_API_BASE_URL}/v2/bookings"
-    print(f"Booking URL: {url}")
     try:
-        print("Sending POST to Cal.com...")
         response = requests.post(
             url,
             json=payload,
-            headers=HEADERS,
+            headers=booking_headers,
             timeout=15.0
         )
 
-        print(f"CAL.COM BOOKING STATUS: {response.status_code}")
-        print(f"CAL.COM BOOKING RESPONSE: {response.text}")
-
         if response.status_code in [200, 201]:
-            try:
-                data = response.json()
-                if data.get("status") == "success":
-                    print(f"CAL.COM BOOKING SUCCESS STATUS IN BODY**: {data}")
-                    result_string = (
-                        "Successfully booked! "
-                        "You will receive an email confirmation shortly."
-                    )
-                else:
-                    print(f"CAL.COM BOOKING FAILED IN BODY: {data}")
-                    result_string = (
-                        "Sorry, booking failed — Cal.com returned an error."
-                    )
-            except ValueError:
-                result_string = (
-                    "Booking may have succeeded but response was invalid."
-                )
+            result_string = (
+                "Successfully booked! "
+                "You will receive an email confirmation shortly."
+            )
         else:
             result_string = (
                 f"Sorry, booking failed (error {response.status_code}). "
@@ -195,17 +232,8 @@ async def vapi_book_appointment(request: Request):
             )
 
     except Exception as e:
-        print(f"SERVER ERROR during booking: {str(e)}")
-        result_string = (
-            "It looks like there was a technical issue while booking your "
-            "appointment. Let me try that again."
-        )
+        import traceback
+        traceback.print_exc()
+        result_string = f"Technical issue: {str(e)}"
 
-    return {
-        "results": [
-            {
-                "toolCallId": tool_call_id,
-                "result": result_string
-            }
-        ]
-    }
+    return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
