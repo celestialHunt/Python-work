@@ -68,3 +68,236 @@ def check_calendar_availability(
         return {"status": "error", "message": "Cal.com API returned failure"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+async def cancel_cal_booking(
+    api_key: str,
+    email: str,
+    booking_uid: str = None
+):
+    """
+    If booking_uid is provided: Cancels that specific booking.
+    If NOT provided: Searches for all active bookings matching
+    the email and returns them.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "cal-api-version": CAL_API_VERSION,
+        "Content-Type": "application/json"
+    }
+
+    # --- PHASE 1: DIRECT CANCELLATION ---
+    if booking_uid:
+        print(f"DEBUG: Executing direct cancellation for UID: {booking_uid}")
+        cancel_url = f"{CAL_API_BASE_URL}/v2/bookings/{booking_uid}/cancel"
+
+        # V2 Requirement: cancellationReason is mandatory for Host-initiated cancels
+        payload = {
+            "cancellationReason": "Cancelled via Enceptor AI Voice Assistant",
+            "cancelSubsequentBookings": False
+        }
+
+        try:
+            res = requests.post(
+                cancel_url,
+                headers=headers,
+                json=payload,
+                timeout=15
+            )
+            print(f"DEBUG: Cancel Status: {res.status_code}")
+
+            if res.status_code in [200, 201]:
+                return f"✅ Success: Appointment for {email} has been cancelled."
+            else:
+                error_data = res.json()
+                msg = error_data.get("error", {}).get("message") or error_data.get("message") or "Unknown error"
+
+                return f"❌ Failed to cancel: {msg}"
+
+        except Exception as e:
+            return f"⚠️ Technical error during cancellation: {str(e)}"
+
+    # --- PHASE 2: DISCOVERY (Search for bookings) ---
+    print(f"DEBUG: Searching for bookings for attendee: {email}")
+    list_url = f"{CAL_API_BASE_URL}/v2/bookings"
+
+    try:
+        # Fetch last 50 bookings to find matches
+        response = requests.get(
+            list_url,
+            headers=headers,
+            params={"take": 50},
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            return f"❌ Error: Unable to access calendar (Status {response.status_code})"
+
+        data = response.json()
+        bookings = data.get("data", [])
+
+        active_matches = []
+        clean_email = email.lower().strip()
+
+        for b in bookings:
+            # Skip if already cancelled
+            if b.get("status", "").lower() == "cancelled":
+                continue
+
+            # Check all possible email locations in the response
+            attendee_emails = [a.get("email", "").lower() for a in b.get("attendees", [])]
+            response_email = b.get("responses", {}).get("email", "").lower()
+
+            if clean_email in attendee_emails or clean_email == response_email:
+                # Format a human-readable time for the AI to speak
+                start_raw = b.get("start")
+                try:
+                    dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+                    display_time = dt.strftime("%A, %B %d at %I:%M %p")
+                except Exception:
+                    display_time = start_raw
+
+                active_matches.append({
+                    "booking_uid": b.get("uid"),
+                    "time": display_time,
+                    "title": b.get("title")
+                })
+
+        # --- PHASE 3: RESULTS HANDLING ---
+        if not active_matches:
+            return f"I couldn't find any active bookings for {email}."
+
+        # If only ONE booking is found, we can be efficient and cancel it immediately
+        if len(active_matches) == 1:
+            single_uid = active_matches[0]["booking_uid"]
+            print(f"DEBUG: Only one match found ({single_uid}). Proceeding to auto-cancel.")
+            return await cancel_cal_booking(
+                api_key=api_key,
+                email=email,
+                booking_uid=single_uid
+            )
+
+        # If MULTIPLE bookings are found, return the list so the AI can ask the user
+        return {
+            "info": "Multiple appointments found. Please ask the user which one they'd like to cancel.",
+            "appointments": active_matches
+        }
+
+    except Exception as e:
+        print(f"❌ CRITICAL SEARCH ERROR: {str(e)}")
+        return f"Technical issue while searching for bookings: {str(e)}"
+
+
+async def reschedule_cal_booking(
+    api_key: str,
+    email: str,
+    new_start_time: str,
+    booking_uid: str = None
+):
+    """
+    Reschedules an appointment.
+    1. If booking_uid is missing, it searches for active bookings under the email.
+    2. If no bookings found, it informs the agent (so the agent can tell the caller).
+    3. If one is found (or provided), it executes the reschedule.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "cal-api-version": CAL_API_VERSION,
+        "Content-Type": "application/json"
+    }
+
+    # --- PHASE 1: DISCOVERY (If we don't have a valid UID) ---
+    if not booking_uid:
+        list_url = f"{CAL_API_BASE_URL}/v2/bookings"
+        try:
+            # Fetch recent bookings to find a match
+            response = requests.get(
+                list_url,
+                headers=headers,
+                params={"take": 50},
+                timeout=15
+            )
+
+            if response.status_code == 401:
+                return "❌ API Key Error: The access token is invalid. Please check your Cal.com settings."
+
+            if response.status_code != 200:
+                return f"❌ Calendar Access Error: Status {response.status_code}"
+
+            data = response.json()
+            bookings = data.get("data", [])
+
+            active_matches = []
+            clean_email = email.lower().strip()
+
+            for b in bookings:
+                # Filter out cancelled meetings
+                if b.get("status", "").lower() == "cancelled":
+                    continue
+
+                # Match email in attendees or response fields
+                attendee_emails = [a.get("email", "").lower() for a in b.get("attendees", [])]
+                if clean_email in attendee_emails or b.get("responses", {}).get("email", "").lower() == clean_email:
+                    active_matches.append(b)
+
+            # HANDLE NO BOOKINGS FOUND
+            if not active_matches:
+                return f"I searched for appointments under '{email}', but I couldn't find any active bookings to reschedule."
+
+            # HANDLE MULTIPLE BOOKINGS (Agent needs to ask which one)
+            if len(active_matches) > 1:
+                options = []
+                for m in active_matches:
+                    dt = datetime.fromisoformat(m.get("start").replace("Z", "+00:00"))
+                    options.append({
+                        "booking_uid": m.get("uid"),
+                        "time": dt.strftime("%A, %B %d at %I:%M %p")
+                    })
+                return {
+                    "info": "Multiple bookings found. Ask the user which one they want to move.",
+                    "appointments": options
+                }
+
+            # Exactly one found? Auto-assign the UID to proceed to Phase 2
+            booking_uid = active_matches[0].get("uid")
+
+        except Exception as e:
+            return f"⚠️ Technical error during search: {str(e)}"
+
+    # --- PHASE 2: EXECUTION (Move the booking) ---
+    reschedule_url = f"{CAL_API_BASE_URL}/v2/bookings/{booking_uid}/reschedule"
+
+    try:
+        # Prepare Times
+        start_dt = datetime.fromisoformat(new_start_time.replace("Z", "+00:00"))
+        # Using timedelta to maintain a default 30-min window
+        # end_dt = start_dt + timedelta(minutes=30)
+
+        payload = {
+            "start": start_dt.isoformat(),
+            # "end": end_dt.isoformat(),
+            "reschedulingReason": "Rescheduled via AI Voice Assistant"
+        }
+
+        res = requests.post(
+            reschedule_url,
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+
+        if res.status_code in [200, 201]:
+            readable_time = start_dt.strftime("%A, %B %d at %I:%M %p")
+            return f"✅ Success! Your appointment has been rescheduled to {readable_time}."
+
+        # Handle specific API failures
+        error_data = res.json()
+        error_msg = error_data.get("error", {}).get("message") or error_data.get("message")
+
+        if "token" in str(error_msg).lower():
+            return "❌ Authorization failed: The API key is invalid or has expired."
+
+        return f"❌ Could not reschedule: {error_msg if error_msg else 'The slot might be taken.'}"
+
+    except Exception as e:
+        return f"⚠️ Technical error during reschedule: {str(e)}"
