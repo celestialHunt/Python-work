@@ -23,7 +23,7 @@ def test_booking():
                         "name": "book_appointment",
                         "arguments": {
                             "name": "John Doe",
-                            "email": "chitrans dot pranav at the rate gmail.com",
+                            "email": "not-an-email",
                             "time": "2026-03-01T15:30:00Z"
                         }
                     }

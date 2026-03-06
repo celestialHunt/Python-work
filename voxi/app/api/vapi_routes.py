@@ -1,4 +1,18 @@
 from fastapi import APIRouter, Request
+import requests
+import json
+import logging
+from app.services.database_service import (
+    get_customer_by_phone
+)
+from app.utils.vapi_utils import (
+    get_caller_number,
+    clean_vapi_email,
+    get_business_phone,
+    normalize_vapi_date,
+    normalize_vapi_booking_time,
+    process_vendor_availability
+)
 from app.services.calendar_service import (
     check_calendar_availability,
     cancel_cal_booking,
@@ -6,250 +20,173 @@ from app.services.calendar_service import (
     CAL_API_BASE_URL,
     CAL_API_VERSION
 )
-import requests
-from datetime import datetime, timedelta
-from app.services.database_service import get_customer_by_phone
-from app.utils.vapi_utils import get_caller_number, clean_vapi_email
-import logging
+
 
 router = APIRouter(prefix="/vapi", tags=["vapi"])
 logger = logging.getLogger(__name__)
 
 
-@router.post("/inbound")
-async def handle_vapi_call(request: Request):
-    data = await request.json()
-    customer_number = get_caller_number(data)
-
-    if customer_number:
-        customer = get_customer_by_phone(customer_number)
-        if customer:
-            # Personalize the greeting using the DB record
-            business_name = customer.get('business_name', 'there')
-            return {
-                "assistant": {
-                    "firstMessage": (
-                        f"Hello {business_name}! "
-                        "How can I help with your calendar today?"
-                    )
-                }
-            }
-
-    # Fallback greeting if no customer is found
-    return {
-        "assistant": {"firstMessage": "Hello there! How can I help you today?"}
-    }
-
-
 @router.post("/check-availability")
 async def vapi_check_availability(request: Request):
-    data = await request.json()
-    # 1. Extract the Tool Call ID (Vapi MUST have this back)
-    message = data.get("message", {})
-    tool_calls = message.get("toolCalls", [])
-    if not tool_calls:
-        return {"error": "No tool calls found"}
+    try:
+        data = await request.json()
+        print(f"DEBUG FULL PAYLOAD: {json.dumps(data, indent=2)}")
 
-    tool_call = tool_calls[0]
-    tool_call_id = tool_call.get("id")
+        # 1. IDENTIFY THE BUSINESS
+        # Uses the utility to handle both Live Phone Calls and Web/Chat tests
+        business_phone = get_business_phone(data, "+16088837790")
+        print(f"business_phone***-->: {business_phone}")
 
-    # 2. Extract the date from Vapi's arguments
-    arguments = tool_call.get("function", {}).get("arguments", {})
-    date_str = arguments.get("date")
-
-    # 3. Now check the database
-    customer_number = get_caller_number(data)
-    customer = get_customer_by_phone(customer_number)
-    if not customer:
-        msg = (
-            "I'm sorry, I couldn't find your business record "
-            "to check the calendar."
-        )
-        return {
-            "results": [{
-                "toolCallId": tool_call_id,
-                "result": msg
-            }]
-        }
-
-    # 4. Call your working calendar service
-    # avail = check_calendar_availability(date_str)
-    avail = check_calendar_availability(
-        date_str=date_str,
-        api_key=customer.get("cal_api_key"),
-        username=customer.get("cal_username"),
-        event_type_slug=customer.get("event_type_slug", "30min"),
-        timezone=customer.get("timezone", "Asia/Kolkata")
-    )
-
-    # 4. Format the result for Vapi
-    if avail.get("status") == "success":
-        slots_data = avail.get("slots", {})
-        # slots_data is a dict like {"2026-02-12": [{"time": "..."}, ...]}
-        date_slots = slots_data.get(date_str, [])
-
-        if not date_slots:
-            result_string = f"No slots available for {date_str}."
-        else:
-            formatted = []
-            for s in date_slots[:5]:
-                time_str = s.get("time")  # Cal.com v2 uses "time", not "start"
-                if time_str and isinstance(time_str, str):
-                    try:
-                        dt = datetime.fromisoformat(time_str)
-                        start = dt.strftime("%I:%M %p")
-                        end = (dt + timedelta(minutes=30)).strftime("%I:%M %p")
-                        formatted.append(f"{start} - {end}")
-                    except ValueError:
-                        formatted.append(time_str)
-
-            result_string = (
-                f"Available slots for {date_str}:\n" + "\n".join(formatted)
-            )
-            if formatted:
-                result_string += "\nWhich time works best for you?"
-            else:
-                result_string += "\nNo times available that day."
-    else:
-        print(f"DEBUG: Availability failed with: {avail}")
-        error_msg = avail.get("message", "Unknown error")
-        result_string = (
-            "Sorry, I couldn't check the calendar: "
-            f"{error_msg}. Try a future date?"
-        )
-
-    # 5. Return the exact JSON structure Vapi requires
-    return {
-        "results": [
-            {
-                "toolCallId": tool_call_id,
-                "result": result_string
+        # 2. EXTRACT TOOL CALL METADATA
+        message = data.get("message", {})
+        tool_calls = message.get("toolCalls", [])
+        if not tool_calls:
+            return {
+                "results": [{"toolCallId": "none", "result": "Internal acknowledgement: No tool execution required."}]
             }
-        ]
-    }
+
+        tool_call = tool_calls[0]
+        tool_call_id = tool_call.get("id")
+        arguments = tool_call.get("function", {}).get("arguments", {})
+
+        date_str = normalize_vapi_date(arguments.get("date"))
+        print(f"date_str***-->: {date_str}")
+        pref_time = arguments.get("preferred_time")
+        print(f"pref_time***-->: {pref_time}")
+        if not date_str:
+            return {"results": [{"toolCallId": tool_call_id, "result": "Please provide a specific date."}]}
+
+        # 3. DATABASE LOOKUP
+        customer = get_customer_by_phone(business_phone)
+        print(f"✅🧑‍🧒CUSTOMER FOUND: {customer}")
+        if not customer:
+            return {
+                "results": [
+                    {
+                        "toolCallId": tool_call_id,
+                        "result": "I'm sorry, this business is not configured yet."
+                    }
+                ]
+            }
+
+        # 4. Call Cal.com using THIS business's specific credentials
+        avail = check_calendar_availability(
+            date_str=date_str,
+            api_key=customer.get("cal_api_key"),
+            username=customer.get("cal_username"),
+            event_type_slug=customer.get("event_type_slug", "30min"),
+            timezone=customer.get("timezone", "Asia/Kolkata")
+        )
+
+        if avail.get("status") == "error":
+            # Specific handle for Cal.com being unreachable
+            logger.error(f"Cal.com API Error: {avail.get('message')}")
+            return {
+                "results": [{
+                    "toolCallId": tool_call_id,
+                    "result": (
+                        "I'm having a brief connection issue with the calendar. "
+                        "One moment while I try that again."
+                    )
+                }]
+            }
+
+        # 5. PROCESS SLOTS (The "Drill Down" Fix)
+        if avail.get("status") == "success":
+            display_slots, total_future = process_vendor_availability(
+                raw_slots=avail.get("slots", {}),
+                date_str=date_str,
+                timezone_name=customer.get("timezone", "Asia/Kolkata"),
+                pref_time=pref_time
+            )
+            if not display_slots:
+                result_string = (
+                    f"I'm sorry, there are no available slots left for {date_str}. "
+                    "Should I check for the following day instead?"
+                )
+            else:
+                times_list = [s['display_time'] for s in display_slots]
+                result_string = f"Available slots for {date_str}:\n" + ", ".join(times_list)
+                if total_future > len(display_slots):
+                    result_string += ". Other times are also available later in the day."
+        else:
+            result_string = "I'm having trouble accessing the calendar right now."
+
+        return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
+
+    except Exception as e:
+        logger.error(f"Availability Route Error: {e}")
+        return {"results": [{"toolCallId": "error", "result": "Technical difficulty."}]}
 
 
 @router.post("/book-appointment")
 async def vapi_book_appointment(request: Request):
-    data = await request.json()
-    print("data::", data)
-    message = data.get("message", {})
-    print("message::", message)
-    tool_calls = message.get("toolCalls", [])
-    print("tool_calls::", tool_calls)
-    if not tool_calls:
-        return {"error": "No tool calls found"}
-
-    tool_call = tool_calls[0]
-    tool_call_id = tool_call.get("id")
-    args = tool_call.get("function", {}).get("arguments", {})
-    print("args::", args)
-
-    # 1. Argument presence validation
-    if not args or not isinstance(args, dict):
-        result_string = (
-            "Sorry, I need name, email, and time to book. "
-            "Can you provide them again?"
-        )
-        return {
-            "results":
-            [{"toolCallId": tool_call_id, "result": result_string}]
-        }
-
-    # 2. Customer Lookup
-    customer_number = get_caller_number(data)
-    customer = get_customer_by_phone(customer_number)
-    print(f"DEBUG: Full customer data: {customer}")
-
-    # 3. Hard Stop if not in DB
-    if not customer:
-        msg = (
-            "I'm sorry, I cannot book because the business record "
-            "is missing."
-        )
-        return {"results": [{"toolCallId": tool_call_id, "result": msg}]}
-
-    # 4. Extract DB values (No .env fallbacks)
-    api_key = customer.get("cal_api_key")
-    tz = customer.get("timezone", "UTC")
-    # Safely convert event_id to integer
+    """Handles final booking with email cleaning and normalized timestamps."""
     try:
-        event_id = int(customer.get("event_type_id"))
-    except (TypeError, ValueError):
-        msg = "Internal Error: Business calendar is not configured correctly."
-        return {"results": [{"toolCallId": tool_call_id, "result": msg}]}
+        data = await request.json()
+        print(f"DEBUG FULL PAYLOAD book app****: {json.dumps(data, indent=2)}")
+        message = data.get("message", {})
+        tool_call = message.get("toolCalls", [{}])[0]
+        tool_call_id = tool_call.get("id")
+        args = tool_call.get("function", {}).get("arguments", {})
+        start_time = normalize_vapi_booking_time(args.get("time"))
 
-    # 5. Build Headers and Payload
-    booking_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "cal-api-version": CAL_API_VERSION,
-        "Content-Type": "application/json"
-    }
+        # 1. Identify the Business
+        business_phone = get_business_phone(data, "+16088837790")
+        customer = get_customer_by_phone(business_phone)
 
-    # 6. Email parsing & validation
-    raw_email = args.get("email", "")
-    email = clean_vapi_email(raw_email)
+        if not customer:
+            return {"results": [{"toolCallId": tool_call_id, "result": "Business record missing."}]}
 
-    # Debug print to see what the cleaned email actually looks like
-    print(f"DEBUG: Raw Email: '{raw_email}' -> Cleaned Email: '{email}'")
-    if "@" not in email or "." not in email.split("@")[-1]:
-        result_string = (
-            "Sorry, the email doesn't look valid. "
-            "Please provide a correct email."
-        )
-        return {
-            "results":
-            [{"toolCallId": tool_call_id, "result": result_string}]
+        booking_headers = {
+            "Authorization": f"Bearer {customer.get('cal_api_key')}",
+            "cal-api-version": CAL_API_VERSION,
+            "Content-Type": "application/json"
         }
 
-    # 7. Start time validation
-    start_time = args.get("time")
-    if not start_time:
-        result_string = "Sorry, I need a time to book the appointment."
-        return {
-            "results":
-            [{"toolCallId": tool_call_id, "result": result_string}]
+        payload = {
+            "start": start_time,
+            "eventTypeId": int(customer.get("event_type_id")),
+            "attendee": {
+                "name": args.get("name", "Guest"),
+                "email": clean_vapi_email(args.get("email")),
+                "timeZone": customer.get("timezone", "Asia/Kolkata")
+            },
+            "bookingFieldsResponses": {
+                "notes": args.get("agenda")
+            },
+            "metadata": {
+                "agenda": args.get("agenda")
+            }
         }
 
-    payload = {
-        "start": start_time,
-        "eventTypeId": event_id,
-        "attendee": {
-            "name": args.get("name", "Guest"),
-            "email": email,
-            "timeZone": tz
-        },
-        "metadata": {}
-    }
+        print(f"DEBUG FULL PAYLOAD book app****: {json.dumps(payload, indent=2)}")
 
-    # 8. Execution
-    url = f"{CAL_API_BASE_URL}/v2/bookings"
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=booking_headers,
-            timeout=15.0
-        )
-        print(f"DEBUG: Cal.com Error Details: {response.text}")
-        if response.status_code in [200, 201]:
-            result_string = (
-                "Successfully booked! "
-                "You will receive an email confirmation shortly."
+        # 3. Execute request to Cal.com
+        try:
+            response = requests.post(
+                f"{CAL_API_BASE_URL}/v2/bookings",
+                json=payload,
+                headers=booking_headers,
+                timeout=15.0
             )
-        else:
-            result_string = (
-                f"Sorry, booking failed (error {response.status_code}). "
-                "Can you try again?"
-            )
+            if response.status_code in [200, 201]:
+                result_string = "Great! You are all booked. Check your email for the confirmation."
+            else:
+                error_data = response.json() if response.text else "No error body"
+                logger.error(f"Booking Failed for {business_phone}: {response.status_code} - {error_data}")
+                result_string = (
+                    "It looks like that specific slot was just taken. "
+                    "Could we try the next available time?"
+                )
 
-    except Exception as e:
-        print(f"❌ CRITICAL ERROR during Cal.com booking: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        result_string = f"Technical issue: {str(e)}"
+        except Exception:
+            result_string = "Technical error while booking."
 
-    return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
+        return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
+
+    except Exception:
+        return {"results": [{"toolCallId": "error", "result": "Booking failed."}]}
 
 
 @router.post("/cancel-appointment")

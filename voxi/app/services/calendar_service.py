@@ -242,7 +242,10 @@ async def reschedule_cal_booking(
 
             # HANDLE NO BOOKINGS FOUND
             if not active_matches:
-                return f"I searched for appointments under '{email}', but I couldn't find any active bookings to reschedule."
+                return (
+                    f"I searched for appointments under '{email}', "
+                    "but I couldn't find any active bookings to reschedule."
+                )
 
             # HANDLE MULTIPLE BOOKINGS (Agent needs to ask which one)
             if len(active_matches) > 1:
