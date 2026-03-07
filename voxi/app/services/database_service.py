@@ -1,5 +1,5 @@
 import os
-import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
@@ -8,7 +8,7 @@ load_dotenv()
 # Initialize a Connection Pool (1 to 10 connections)
 # This stays alive for the life of your FastAPI app
 try:
-    db_pool = psycopg2.pool.SimpleConnectionPool(
+    db_pool = pool.SimpleConnectionPool(
         1, 20,  # Min 1, Max 20 connections
         user=os.getenv("DB_USER"),
         host=os.getenv("DB_HOST"),

@@ -1,18 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import logging
 
 logger = logging.getLogger(__name__)
-
-
-def get_caller_number(data: dict):
-    """Safely extracts the phone number from the Vapi webhook payload."""
-    return (
-        data.get("message", {})
-            .get("call", {})
-            .get("customer", {})
-            .get("number")
-    )
 
 
 def get_business_phone(data, default_number):
@@ -105,7 +95,7 @@ def process_vendor_availability(raw_slots, date_str, timezone_name, pref_time=No
     """
     try:
         vendor_tz = ZoneInfo(timezone_name)
-        now_local = datetime.now(vendor_tz)
+        now_local = datetime.now(timezone.utc).astimezone(vendor_tz)
 
         all_raw_date_slots = extract_slots_safely(raw_slots, date_str)
         all_raw_date_slots.sort(key=lambda x: x.get("time"))
@@ -117,7 +107,7 @@ def process_vendor_availability(raw_slots, date_str, timezone_name, pref_time=No
             local_dt = utc_dt.astimezone(vendor_tz)
 
             # Filter: Is this slot in the future?
-            if local_dt > now_local:
+            if local_dt > (now_local + timedelta(minutes=30)):
                 s['display_time'] = local_dt.strftime("%I:%M %p")
                 future_slots.append(s)
 

@@ -2,11 +2,11 @@ from fastapi import APIRouter, Request
 import requests
 import json
 import logging
+from datetime import datetime
 from app.services.database_service import (
     get_customer_by_phone
 )
 from app.utils.vapi_utils import (
-    get_caller_number,
     clean_vapi_email,
     get_business_phone,
     normalize_vapi_date,
@@ -15,8 +15,7 @@ from app.utils.vapi_utils import (
 )
 from app.services.calendar_service import (
     check_calendar_availability,
-    cancel_cal_booking,
-    reschedule_cal_booking,
+    create_cal_booking,
     CAL_API_BASE_URL,
     CAL_API_VERSION
 )
@@ -34,7 +33,7 @@ async def vapi_check_availability(request: Request):
 
         # 1. IDENTIFY THE BUSINESS
         # Uses the utility to handle both Live Phone Calls and Web/Chat tests
-        business_phone = get_business_phone(data, "+16088837790")
+        business_phone = get_business_phone(data, "+18622252071")
         print(f"business_phone***-->: {business_phone}")
 
         # 2. EXTRACT TOOL CALL METADATA
@@ -91,8 +90,9 @@ async def vapi_check_availability(request: Request):
                 }]
             }
 
-        # 5. PROCESS SLOTS (The "Drill Down" Fix)
+        # 5. PROCESS SLOTS
         if avail.get("status") == "success":
+            logger.info(f"Checking availability. Current server-aware time is: {datetime.now()}")
             display_slots, total_future = process_vendor_availability(
                 raw_slots=avail.get("slots", {}),
                 date_str=date_str,
@@ -132,43 +132,22 @@ async def vapi_book_appointment(request: Request):
         start_time = normalize_vapi_booking_time(args.get("time"))
 
         # 1. Identify the Business
-        business_phone = get_business_phone(data, "+16088837790")
+        business_phone = get_business_phone(data, "+18622252071")
         customer = get_customer_by_phone(business_phone)
 
         if not customer:
             return {"results": [{"toolCallId": tool_call_id, "result": "Business record missing."}]}
 
-        booking_headers = {
-            "Authorization": f"Bearer {customer.get('cal_api_key')}",
-            "cal-api-version": CAL_API_VERSION,
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "start": start_time,
-            "eventTypeId": int(customer.get("event_type_id")),
-            "attendee": {
-                "name": args.get("name", "Guest"),
-                "email": clean_vapi_email(args.get("email")),
-                "timeZone": customer.get("timezone", "Asia/Kolkata")
-            },
-            "bookingFieldsResponses": {
-                "notes": args.get("agenda")
-            },
-            "metadata": {
-                "agenda": args.get("agenda")
-            }
-        }
-
-        print(f"DEBUG FULL PAYLOAD book app****: {json.dumps(payload, indent=2)}")
-
         # 3. Execute request to Cal.com
         try:
-            response = requests.post(
-                f"{CAL_API_BASE_URL}/v2/bookings",
-                json=payload,
-                headers=booking_headers,
-                timeout=15.0
+            response = create_cal_booking(
+                api_key=customer.get("cal_api_key"),
+                event_type_id=customer.get("event_type_id"),
+                name=args.get("name"),
+                email=clean_vapi_email(args.get("email")),
+                start_time=start_time,
+                timezone=customer.get("timezone", "Asia/Kolkata"),
+                agenda=args.get("agenda")
             )
             if response.status_code in [200, 201]:
                 result_string = "Great! You are all booked. Check your email for the confirmation."
@@ -180,13 +159,16 @@ async def vapi_book_appointment(request: Request):
                     "Could we try the next available time?"
                 )
 
-        except Exception:
-            result_string = "Technical error while booking."
+        except Exception as api_err:
+            # This catches network timeouts or connection drops
+            logger.error(f"Inner API Exception: {api_err}")
+            result_string = "I'm having a bit of trouble connecting to the booking system. One moment."
 
         return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
 
-    except Exception:
-        return {"results": [{"toolCallId": "error", "result": "Booking failed."}]}
+    except Exception as e:
+        logger.error(f"Global Booking Route Error: {e}")
+        return {"results": [{"toolCallId": "error", "result": "System error. Please try again."}]}
 
 
 @router.post("/cancel-appointment")

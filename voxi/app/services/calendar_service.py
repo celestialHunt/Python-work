@@ -3,8 +3,12 @@ import requests
 from datetime import datetime, date
 from typing import Dict, Any
 from dotenv import load_dotenv
+import logging
+import json
+
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 CAL_API_BASE_URL = os.getenv("CAL_API_BASE_URL")
 CAL_API_VERSION = os.getenv("CAL_API_VERSION")
@@ -66,8 +70,58 @@ def check_calendar_availability(
                 "slots": {date_str: data.get("data", {}).get("slots", [])}
             }
         return {"status": "error", "message": "Cal.com API returned failure"}
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def create_cal_booking(
+    api_key,
+    event_type_id,
+    name,
+    email,
+    start_time,
+    timezone,
+    agenda=None
+):
+    """
+    Handles the actual API call to Cal.com to create a booking.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "cal-api-version": CAL_API_VERSION,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "start": start_time,
+        "eventTypeId": int(event_type_id),
+        "attendee": {
+            "name": name or "Guest",
+            "email": email,
+            "timeZone": timezone
+        },
+        "bookingFieldsResponses": {
+            "notes": agenda
+        },
+        "metadata": {
+            "agenda": agenda
+        }
+    }
+    print(f"DEBUG FULL PAYLOAD book app****: {json.dumps(payload, indent=2)}")
+
+    try:
+        response = requests.post(
+            f"{CAL_API_BASE_URL}/v2/bookings",
+            json=payload,
+            headers=headers,
+            timeout=15.0
+        )
+        return response
+
+    except Exception as e:
+        logger.error(f"Booking API Exception: {e}")
+        return None
 
 
 async def cancel_cal_booking(
