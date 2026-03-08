@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Request
-import requests
 import json
 import logging
 from datetime import datetime
@@ -16,8 +15,8 @@ from app.utils.vapi_utils import (
 from app.services.calendar_service import (
     check_calendar_availability,
     create_cal_booking,
-    CAL_API_BASE_URL,
-    CAL_API_VERSION
+    cancel_cal_booking,
+    reschedule_cal_booking
 )
 
 
@@ -174,145 +173,113 @@ async def vapi_book_appointment(request: Request):
 @router.post("/cancel-appointment")
 async def vapi_cancel_appointment(request: Request):
     """
-    Vapi Tool Call endpoint for cancelling or searching appointments.
-    Matches against the Cal.com V2 logic in calendar_service.py.
+    Production route to cancel a booking.
+    Matches the business, finds the latest booking by email, and cancels it.
     """
     try:
         data = await request.json()
 
-        # 1. Extract Tool Call Details
+        # 1. Extract Tool Details
         message = data.get("message", {})
-        tool_calls = message.get("toolCallList") or message.get("toolCalls") or []
-
-        if not tool_calls:
-            return {"results": [{"result": "No tool call found in request."}]}
-
+        tool_calls = message.get("toolCalls", [{}])
         tool_call = tool_calls[0]
         tool_call_id = tool_call.get("id")
         args = tool_call.get("function", {}).get("arguments", {})
 
-        # 2. Identify the User/Business
-        customer_number = get_caller_number(data)
-        # Identify which client's calendar we are managing based on the phone number
-        customer = get_customer_by_phone(customer_number)
+        # 2. Identify the Business
+        business_phone = get_business_phone(data, "+18622252071")
+        customer = get_customer_by_phone(business_phone)
 
-        if not customer or not customer.get("cal_api_key"):
+        if not customer:
             return {
-                "results": [{
-                    "toolCallId": tool_call_id,
-                    "result": "Error: Business configuration not found for this number."
-                }]
+                "results": [
+                    {
+                        "toolCallId": tool_call_id,
+                        "result": "Business config not found."
+                    }
+                ]
             }
 
-        # 3. Extract Arguments for the Tool
+        # 3. Clean Inputs
         target_email = clean_vapi_email(args.get("email"))
-        # Optional: provided by AI on second step
-        booking_uid = args.get("booking_uid")
 
         if not target_email:
-            return {
-                "results": [{
+            return {"results": [
+                {
                     "toolCallId": tool_call_id,
-                    "result": "Error: Attendee email is required to find bookings."
-                }]
-            }
+                    "result": "I need your email to find the booking."
+                }
+            ]}
 
-        # 4. Execute Service Logic
-        # This will either return a list of bookings or a success message
-        service_result = await cancel_cal_booking(
-            api_key=customer["cal_api_key"],
+        # 4. CALL YOUR SERVICE FUNCTION
+        result = await cancel_cal_booking(
+            api_key=customer.get("cal_api_key"),
             email=target_email,
-            booking_uid=booking_uid
+            booking_uid=args.get("booking_uid")
         )
 
-        # 5. Return formatted response for Vapi to read
+        # 3. HANDLE THE RESULT TYPE (String vs Dictionary)
+        if isinstance(result, dict):
+            # If multiple bookings were found, your code returns a dict
+            options = ", ".join([f"at {a['time']}" for a in result.get("appointments", [])])
+            result_string = f"I found multiple appointments for you: {options}. Which one would you like to cancel?"
+        else:
+            result_string = result
+
+        return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
+
+    except Exception as e:
+        logger.error(f"Cancel Route Error: {e}")
         return {
             "results": [
                 {
-                    "toolCallId": tool_call_id,
-                    "result": service_result
+                    "toolCallId": "error",
+                    "result": "I ran into a technical issue while trying to cancel."
                 }
             ]
-        }
-
-    except Exception as e:
-        logger.error(f"Vapi Route Error: {str(e)}")
-        return {
-            "results": [{
-                "toolCallId": "error",
-                "result": f"Internal server error: {str(e)}"
-            }]
         }
 
 
 @router.post("/reschedule-appointment")
 async def vapi_reschedule_appointment(request: Request):
     """
-    Vapi Tool Call endpoint for rescheduling.
-    It takes the email, new time, and an optional booking_uid.
+    Finds the existing booking and patches it with a new 'start' time.
     """
     try:
         data = await request.json()
-
-        # 1. Extract Tool Call Details
-        message = data.get("message", {})
-        tool_calls = message.get("toolCallList") or message.get("toolCalls") or []
-
-        if not tool_calls:
-            return {"results": [{"result": "No tool call found"}]}
-
-        tool_call = tool_calls[0]
+        tool_call = data.get("message", {}).get("toolCalls", [{}])[0]
         tool_call_id = tool_call.get("id")
         args = tool_call.get("function", {}).get("arguments", {})
 
-        # 2. Get Customer Data
-        customer_number = get_caller_number(data)
-        customer = get_customer_by_phone(customer_number)
+        business_phone = get_business_phone(data, "+16088837790")
+        customer = get_customer_by_phone(business_phone)
+        if not customer:
+            return {"results": [{"toolCallId": tool_call_id, "result": "Business record missing."}]}
 
-        if not customer or not customer.get("cal_api_key"):
-            return {
-                "results": [{
-                    "toolCallId": tool_call_id,
-                    "result": "Error: Business calendar configuration not found."
-                }]
-            }
-
-        # 3. Extract Arguments
-        # AI provides these based on your Vapi Tool configuration
+        # Normalize the new time (Fixes the 2024/2025 year hallucination)
         target_email = clean_vapi_email(args.get("email"))
-        new_time = args.get("new_start_time")
-        booking_uid = args.get("booking_uid")  # May be None if AI is searching
+        new_time = normalize_vapi_booking_time(args.get("new_start_time"))
 
-        if not target_email or not new_time:
-            return {
-                "results": [{
-                    "toolCallId": tool_call_id,
-                    "result": "I need both your email and the new time to reschedule."
-                }]
-            }
-
-        # 4. Execute Reschedule Service
-        service_result = await reschedule_cal_booking(
-            api_key=customer["cal_api_key"],
+        # 3. CALL YOUR SERVICE (Phase 1 & 2 combined)
+        # This will either return a Success string, an Error string, or a Dictionary for multiple matches.
+        result = await reschedule_cal_booking(
+            api_key=customer.get("cal_api_key"),
             email=target_email,
             new_start_time=new_time,
-            booking_uid=booking_uid
+            booking_uid=args.get("booking_uid")
         )
 
-        return {
-            "results": [
-                {
-                    "toolCallId": tool_call_id,
-                    "result": service_result
-                }
-            ]
-        }
+        # 4. Handle Response Type (Matches your Cancel logic)
+        if isinstance(result, dict):
+            # Handles the "Multiple bookings found" dictionary
+            options = ", ".join([f"at {a['time']}" for a in result.get("appointments", [])])
+            result_string = f"I found multiple appointments for you: {options}. Which one should I move?"
+        else:
+            # Handles the Success/Error strings
+            result_string = result
+
+        return {"results": [{"toolCallId": tool_call_id, "result": result_string}]}
 
     except Exception as e:
-        logger.error(f"Reschedule Route Error: {str(e)}")
-        return {
-            "results": [{
-                "toolCallId": "error",
-                "result": f"System error: {str(e)}"
-            }]
-        }
+        logger.error(f"Reschedule Route Error: {e}")
+        return {"results": [{"toolCallId": "error", "result": "Technical error during rescheduling."}]}

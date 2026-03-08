@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 import logging
 import json
 
-
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -174,7 +173,6 @@ async def cancel_cal_booking(
     # --- PHASE 2: DISCOVERY (Search for bookings) ---
     print(f"DEBUG: Searching for bookings for attendee: {email}")
     list_url = f"{CAL_API_BASE_URL}/v2/bookings"
-
     try:
         # Fetch last 50 bookings to find matches
         response = requests.get(
@@ -189,7 +187,6 @@ async def cancel_cal_booking(
 
         data = response.json()
         bookings = data.get("data", [])
-
         active_matches = []
         clean_email = email.lower().strip()
 
@@ -323,16 +320,11 @@ async def reschedule_cal_booking(
 
     # --- PHASE 2: EXECUTION (Move the booking) ---
     reschedule_url = f"{CAL_API_BASE_URL}/v2/bookings/{booking_uid}/reschedule"
-
     try:
         # Prepare Times
         start_dt = datetime.fromisoformat(new_start_time.replace("Z", "+00:00"))
-        # Using timedelta to maintain a default 30-min window
-        # end_dt = start_dt + timedelta(minutes=30)
-
         payload = {
             "start": start_dt.isoformat(),
-            # "end": end_dt.isoformat(),
             "reschedulingReason": "Rescheduled via AI Voice Assistant"
         }
 
