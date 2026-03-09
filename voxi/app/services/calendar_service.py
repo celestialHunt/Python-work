@@ -189,10 +189,15 @@ async def cancel_cal_booking(
         bookings = data.get("data", [])
         active_matches = []
         clean_email = email.lower().strip()
+        today_iso = datetime.now().isoformat()
 
         for b in bookings:
-            # Skip if already cancelled
-            if b.get("status", "").lower() == "cancelled":
+            # ONLY look at 'upcoming' or 'booked' status
+            if b.get("status", "").lower() not in ["upcoming", "booked"]:
+                continue
+
+            # ONLY look at future meetings
+            if b.get("start") < today_iso:
                 continue
 
             # Check all possible email locations in the response
@@ -206,12 +211,11 @@ async def cancel_cal_booking(
                     dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
                     display_time = dt.strftime("%A, %B %d at %I:%M %p")
                 except Exception:
-                    display_time = start_raw
+                    display_time = start_raw  # Fallback if parsing fails
 
                 active_matches.append({
                     "booking_uid": b.get("uid"),
-                    "time": display_time,
-                    "title": b.get("title")
+                    "time": display_time
                 })
 
         # --- PHASE 3: RESULTS HANDLING ---
@@ -278,18 +282,35 @@ async def reschedule_cal_booking(
             data = response.json()
             bookings = data.get("data", [])
 
+            today_iso = datetime.now().isoformat()
             active_matches = []
             clean_email = email.lower().strip()
 
             for b in bookings:
-                # Filter out cancelled meetings
-                if b.get("status", "").lower() == "cancelled":
+                # ONLY look at 'upcoming' or 'booked' status
+                if b.get("status", "").lower() not in ["upcoming", "booked"]:
+                    continue
+
+                # ONLY look at future meetings
+                if b.get("start") < today_iso:
                     continue
 
                 # Match email in attendees or response fields
                 attendee_emails = [a.get("email", "").lower() for a in b.get("attendees", [])]
-                if clean_email in attendee_emails or b.get("responses", {}).get("email", "").lower() == clean_email:
-                    active_matches.append(b)
+                responses_email = b.get("responses", {}).get("email", "").lower()
+
+                if clean_email in attendee_emails or clean_email == responses_email:
+                    start_raw = b.get("start")
+                    try:
+                        dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+                        display_time = dt.strftime("%A, %B %d at %I:%M %p")
+                    except Exception:
+                        display_time = start_raw  # Fallback if parsing fails
+
+                    active_matches.append({
+                        "booking_uid": b.get("uid"),
+                        "time": display_time
+                    })
 
             # HANDLE NO BOOKINGS FOUND
             if not active_matches:
@@ -298,18 +319,11 @@ async def reschedule_cal_booking(
                     "but I couldn't find any active bookings to reschedule."
                 )
 
-            # HANDLE MULTIPLE BOOKINGS (Agent needs to ask which one)
+            # HANDLE MULTIPLE BOOKINGS
             if len(active_matches) > 1:
-                options = []
-                for m in active_matches:
-                    dt = datetime.fromisoformat(m.get("start").replace("Z", "+00:00"))
-                    options.append({
-                        "booking_uid": m.get("uid"),
-                        "time": dt.strftime("%A, %B %d at %I:%M %p")
-                    })
                 return {
                     "info": "Multiple bookings found. Ask the user which one they want to move.",
-                    "appointments": options
+                    "appointments": active_matches
                 }
 
             # Exactly one found? Auto-assign the UID to proceed to Phase 2
