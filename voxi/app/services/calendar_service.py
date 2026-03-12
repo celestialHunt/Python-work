@@ -1,10 +1,15 @@
 import os
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, Any
 from dotenv import load_dotenv
 import logging
-import json
+# import json
+from app.utils.vapi_utils import (
+    normalize_vapi_booking_time,
+    utc_iso_to_tz_display
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -18,32 +23,47 @@ def check_calendar_availability(
     api_key: str,
     username: str,
     event_type_slug: str,
-    timezone: str
+    timezone_name: str
 ) -> Dict[str, Any]:
     """
     Fetch available slots using specific business credentials and timezone.
     """
+    logger.info(f"Checking availability. Current server-aware time is: {datetime.now()}")
     # 1. Validation
-    if not all([api_key, username, timezone, event_type_slug]):
+    if not all([api_key, username, timezone_name, event_type_slug]):
         return {
             "status": "error",
             "message": "Missing business configuration in database"
         }
 
     try:
-        if datetime.strptime(date_str, "%Y-%m-%d").date() < date.today():
+        requested_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        today = date.today()
+        if requested_date < today:
             return {"status": "error", "message": "Cannot query past dates"}
+        end_time_iso = f"{date_str}T23:59:59Z"
+
+        if requested_date == today:
+            now_local = datetime.now(ZoneInfo(timezone_name))
+            start_time_iso = now_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            # For future dates, search from the very beginning of that day
+            start_time_iso = f"{date_str}T00:00:00Z"
+
+            # End time is always the very end of the requested day
+            end_time_iso = f"{date_str}T23:59:59Z"
+
     except ValueError:
-        return {"status": "error", "message": "Invalid date format"}
+        return {"status": "error", "message": "Invalid date format. Use YYYY-MM-DD"}
 
     # 2. Request Setup
     url = f"{CAL_API_BASE_URL}/v2/slots/available"
     params = {
         "usernameList[]": [username],
         "eventTypeSlug": event_type_slug,
-        "startTime": f"{date_str}T00:00:00Z",
-        "endTime": f"{date_str}T23:59:59Z",
-        "timeZone": timezone,
+        "startTime": start_time_iso,
+        "endTime": end_time_iso,
+        "timeZone": timezone_name,
     }
 
     headers = {
@@ -60,6 +80,7 @@ def check_calendar_availability(
             headers=headers,
             timeout=10
         )
+        print("\ncalendar service checkAvailability response:::--->", {response})
         response.raise_for_status()
         data = response.json()
 
@@ -71,6 +92,7 @@ def check_calendar_availability(
         return {"status": "error", "message": "Cal.com API returned failure"}
 
     except Exception as e:
+        logger.error(f"Availability API Failure: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 
@@ -80,7 +102,7 @@ def create_cal_booking(
     name,
     email,
     start_time,
-    timezone,
+    timezone_name,
     agenda=None
 ):
     """
@@ -92,13 +114,18 @@ def create_cal_booking(
         "Content-Type": "application/json"
     }
 
+    start_time = normalize_vapi_booking_time(start_time, timezone_name)
+    if not start_time:
+        logger.error("Missing/invalid start_time after normalization")
+        return None
+
     payload = {
         "start": start_time,
         "eventTypeId": int(event_type_id),
         "attendee": {
             "name": name or "Guest",
             "email": email,
-            "timeZone": timezone
+            "timeZone": timezone_name
         },
         "bookingFieldsResponses": {
             "notes": agenda
@@ -107,7 +134,7 @@ def create_cal_booking(
             "agenda": agenda
         }
     }
-    print(f"DEBUG FULL PAYLOAD book app****: {json.dumps(payload, indent=2)}")
+    # print(f"DEBUG FULL PAYLOAD book app****: {json.dumps(payload, indent=2)}\n")
 
     try:
         response = requests.post(
@@ -116,6 +143,10 @@ def create_cal_booking(
             headers=headers,
             timeout=15.0
         )
+        print("\ncalendar service createBooking response:::--->", {response})
+        # Log the specific error from Cal.com if it fails
+        if response.status_code not in [200, 201]:
+            logger.error(f"Cal.com Booking Error: {response.status_code} - {response.text}")
         return response
 
     except Exception as e:
@@ -126,6 +157,7 @@ def create_cal_booking(
 async def cancel_cal_booking(
     api_key: str,
     email: str,
+    timezone_name: str,
     booking_uid: str = None
 ):
     """
@@ -139,9 +171,9 @@ async def cancel_cal_booking(
         "Content-Type": "application/json"
     }
 
-    # --- PHASE 1: DIRECT CANCELLATION ---
+    # --- PHASE 1: DIRECT CANCELLATION (If we have the UID) ---
     if booking_uid:
-        print(f"DEBUG: Executing direct cancellation for UID: {booking_uid}")
+        print(f"DEBUG: Executing direct cancellation for UID: {booking_uid}\n")
         cancel_url = f"{CAL_API_BASE_URL}/v2/bookings/{booking_uid}/cancel"
 
         # V2 Requirement: cancellationReason is mandatory for Host-initiated cancels
@@ -157,7 +189,7 @@ async def cancel_cal_booking(
                 json=payload,
                 timeout=15
             )
-            print(f"DEBUG: Cancel Status: {res.status_code}")
+            print(f"DEBUG: Cancel Status: {res.status_code}\n")
 
             if res.status_code in [200, 201]:
                 return f"✅ Success: Appointment for {email} has been cancelled."
@@ -170,15 +202,19 @@ async def cancel_cal_booking(
         except Exception as e:
             return f"⚠️ Technical error during cancellation: {str(e)}"
 
-    # --- PHASE 2: DISCOVERY (Search for bookings) ---
-    print(f"DEBUG: Searching for bookings for attendee: {email}")
+    # --- PHASE 2: DISCOVERY (Search for bookings using direct API filters) ---
     list_url = f"{CAL_API_BASE_URL}/v2/bookings"
     try:
-        # Fetch last 50 bookings to find matches
+        # LET THE API FILTER BY EMAIL AND STATUS
+        params = {
+            "attendeeEmail": email,
+            "status": "upcoming",
+            "take": 5
+        }
         response = requests.get(
             list_url,
             headers=headers,
-            params={"take": 50},
+            params=params,
             timeout=15
         )
 
@@ -188,65 +224,52 @@ async def cancel_cal_booking(
         data = response.json()
         bookings = data.get("data", [])
         active_matches = []
-        clean_email = email.lower().strip()
-        today_iso = datetime.now().isoformat()
 
         for b in bookings:
-            # ONLY look at 'upcoming' or 'booked' status
-            if b.get("status", "").lower() not in ["upcoming", "booked"]:
-                continue
+            # Every booking here already matches the email thanks to 'params'
+            start_raw = b.get("start")
+            try:
+                display_time = utc_iso_to_tz_display(start_raw, timezone_name)
+            except Exception:
+                display_time = start_raw
 
-            # ONLY look at future meetings
-            if b.get("start") < today_iso:
-                continue
-
-            # Check all possible email locations in the response
-            attendee_emails = [a.get("email", "").lower() for a in b.get("attendees", [])]
-            response_email = b.get("responses", {}).get("email", "").lower()
-
-            if clean_email in attendee_emails or clean_email == response_email:
-                # Format a human-readable time for the AI to speak
-                start_raw = b.get("start")
-                try:
-                    dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-                    display_time = dt.strftime("%A, %B %d at %I:%M %p")
-                except Exception:
-                    display_time = start_raw  # Fallback if parsing fails
-
-                active_matches.append({
-                    "booking_uid": b.get("uid"),
-                    "time": display_time
-                })
+            active_matches.append({
+                "booking_uid": b.get("uid"),
+                "time": display_time
+            })
 
         # --- PHASE 3: RESULTS HANDLING ---
         if not active_matches:
-            return f"I couldn't find any active bookings for {email}."
+            return {"status": "none_found", "email": email}
 
-        # If only ONE booking is found, we can be efficient and cancel it immediately
+        # If only ONE booking is found, we can cancel it after user confirms
         if len(active_matches) == 1:
             single_uid = active_matches[0]["booking_uid"]
-            print(f"DEBUG: Only one match found ({single_uid}). Proceeding to auto-cancel.")
-            return await cancel_cal_booking(
-                api_key=api_key,
-                email=email,
-                booking_uid=single_uid
-            )
+            # found_time = active_matches[0]["time"]
+            print(f"DEBUG: Only one match found ({single_uid} under {email}). Proceeding to auto-cancel.\n")
+            return {
+                "status": "single_found",
+                "appointment": active_matches[0],
+                "email": email
+            }
 
         # If MULTIPLE bookings are found, return the list so the AI can ask the user
         return {
-            "info": "Multiple appointments found. Please ask the user which one they'd like to cancel.",
-            "appointments": active_matches
+            "status": "multiple_found",
+            "appointments": active_matches,
+            "email": email
         }
 
     except Exception as e:
-        print(f"❌ CRITICAL SEARCH ERROR: {str(e)}")
+        print(f"❌ CRITICAL SEARCH ERROR: {str(e)}\n")
         return f"Technical issue while searching for bookings: {str(e)}"
 
 
 async def reschedule_cal_booking(
     api_key: str,
     email: str,
-    new_start_time: str,
+    timezone_name: str,
+    new_start_time: str = None,
     booking_uid: str = None
 ):
     """
@@ -265,14 +288,20 @@ async def reschedule_cal_booking(
     if not booking_uid:
         list_url = f"{CAL_API_BASE_URL}/v2/bookings"
         try:
+            params = {
+                "attendeeEmail": email,
+                "status": "upcoming",
+                "take": 5
+            }
+
             # Fetch recent bookings to find a match
             response = requests.get(
                 list_url,
                 headers=headers,
-                params={"take": 50},
+                params=params,
                 timeout=15
             )
-
+            print("\ncalendar service reschedule response:::--->", {response})
             if response.status_code == 401:
                 return "❌ API Key Error: The access token is invalid. Please check your Cal.com settings."
 
@@ -281,38 +310,23 @@ async def reschedule_cal_booking(
 
             data = response.json()
             bookings = data.get("data", [])
+            print(f"bookings data reschedule app from calendar service****: {bookings}\n")
 
-            today_iso = datetime.now().isoformat()
             active_matches = []
-            clean_email = email.lower().strip()
-
             for b in bookings:
-                # ONLY look at 'upcoming' or 'booked' status
-                if b.get("status", "").lower() not in ["upcoming", "booked"]:
-                    continue
+                start_raw = b.get("start")
+                try:
+                    display_time = utc_iso_to_tz_display(start_raw, timezone_name)
+                except Exception:
+                    display_time = start_raw
 
-                # ONLY look at future meetings
-                if b.get("start") < today_iso:
-                    continue
+                active_matches.append({
+                    "booking_uid": b.get("uid"),
+                    "time": display_time
+                })
+                print(f"calendar service--reschedule booking -- active_matches****: {active_matches}\n")
 
-                # Match email in attendees or response fields
-                attendee_emails = [a.get("email", "").lower() for a in b.get("attendees", [])]
-                responses_email = b.get("responses", {}).get("email", "").lower()
-
-                if clean_email in attendee_emails or clean_email == responses_email:
-                    start_raw = b.get("start")
-                    try:
-                        dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-                        display_time = dt.strftime("%A, %B %d at %I:%M %p")
-                    except Exception:
-                        display_time = start_raw  # Fallback if parsing fails
-
-                    active_matches.append({
-                        "booking_uid": b.get("uid"),
-                        "time": display_time
-                    })
-
-            # HANDLE NO BOOKINGS FOUND
+            # HANDLE Results NO BOOKINGS FOUND
             if not active_matches:
                 return (
                     f"I searched for appointments under '{email}', "
@@ -327,21 +341,30 @@ async def reschedule_cal_booking(
                 }
 
             # Exactly one found? Auto-assign the UID to proceed to Phase 2
-            booking_uid = active_matches[0].get("uid")
+            booking_uid = active_matches[0].get("booking_uid")
+            found_time = active_matches[0]['time']
+
+            # If the user JUST wanted to know "When is my meeting?" (no new_start_time provided)
+            if not new_start_time:
+                return (
+                    f"I found your appointment for {found_time}. "
+                    "What new time or date would you like to move it to?"
+                )
 
         except Exception as e:
+            logger.error(f"Search Error: {e}")
             return f"⚠️ Technical error during search: {str(e)}"
 
     # --- PHASE 2: EXECUTION (Move the booking) ---
     reschedule_url = f"{CAL_API_BASE_URL}/v2/bookings/{booking_uid}/reschedule"
     try:
         # Prepare Times
-        start_dt = datetime.fromisoformat(new_start_time.replace("Z", "+00:00"))
+        start_utc = normalize_vapi_booking_time(new_start_time, timezone_name)
         payload = {
-            "start": start_dt.isoformat(),
+            "start": start_utc,
             "reschedulingReason": "Rescheduled via AI Voice Assistant"
         }
-
+        print(f"Calendar Service reschedule payload:::---***{payload}\n")
         res = requests.post(
             reschedule_url,
             headers=headers,
@@ -350,7 +373,13 @@ async def reschedule_cal_booking(
         )
 
         if res.status_code in [200, 201]:
-            readable_time = start_dt.strftime("%A, %B %d at %I:%M %p")
+            start_local = datetime.fromisoformat(new_start_time.replace("Z", "+00:00"))
+            if start_local.tzinfo is None:
+                start_local = start_local.replace(tzinfo=ZoneInfo(timezone_name))
+            else:
+                start_local = start_local.astimezone(ZoneInfo(timezone_name))
+
+            readable_time = start_local.strftime("%A, %B %d at %I:%M %p")
             return f"✅ Success! Your appointment has been rescheduled to {readable_time}."
 
         # Handle specific API failures
@@ -363,4 +392,5 @@ async def reschedule_cal_booking(
         return f"❌ Could not reschedule: {error_msg if error_msg else 'The slot might be taken.'}"
 
     except Exception as e:
+        logger.error(f"Reschedule Execution Error: {e}")
         return f"⚠️ Technical error during reschedule: {str(e)}"

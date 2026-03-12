@@ -1,8 +1,26 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+
+def get_current_datetime_payload(timezone_name: str | None):
+    tz_name = timezone_name or "Asia/Kolkata"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = "Asia/Kolkata"
+        tz = ZoneInfo(tz_name)
+
+    now = datetime.now(tz)
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "iso": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "timezone": tz_name
+    }
 
 
 def get_business_phone(data, default_number):
@@ -70,89 +88,143 @@ def normalize_vapi_date(date_input: str) -> str:
     return clean_date
 
 
-def normalize_vapi_booking_time(time_input: str) -> str:
+def normalize_vapi_booking_time(time_input: str, timezone_name: str = "Asia/Kolkata") -> str:
     """
-    Specifically for booking, fixes the year while preserving
-    the full ISO timestamp and offset.
+    Converts user/model provided time to UTC for Cal.com.
+    - If input has timezone (Z or +HH:MM), respect it.
+    - If input is naive, assume Asia/Kolkata.
+    - Fixes hallucinated past years for YYYY-... inputs.
     """
-    if not time_input:
+    if not time_input or not isinstance(time_input, str):
+        return None
+
+    s = time_input.strip()
+
+    # Year fix (only if starts with YYYY)
+    if len(s) >= 4 and s[:4].isdigit():
+        current_year = datetime.now().year
+        try:
+            y = int(s[:4])
+            if y < current_year:
+                s = str(current_year) + s[4:]
+        except Exception:
+            pass
+
+    try:
+        # Parse trailing Z as UTC
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(s)
+        ist = ZoneInfo(timezone_name)
+
+        # If naive, assume IST
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ist)
+
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    except Exception as e:
+        logger.error(f"Normalization failed, using raw: {e}")
         return time_input
-
-    current_year = str(datetime.now().year)
-    # If the first 4 characters are a year in the past
-    if int(time_input[:4]) < int(current_year):
-        return current_year + time_input[4:]
-
-    return time_input
 
 
 def process_vendor_availability(raw_slots, date_str, timezone_name, pref_time=None):
     """
-    Background Process:
-    1. Converts UTC to Local.
-    2. Filters out past slots.
-    3. Centers around preferred time.
+    Refines raw slots from Cal.com:
+    1. Converts UTC timestamps to the Business's Local Time.
+    2. Filters out slots that have already passed.
+    3. Trims the list to a readable window for the AI.
     """
     try:
         vendor_tz = ZoneInfo(timezone_name)
+        # Get the exact current time in the business's timezone
         now_local = datetime.now(timezone.utc).astimezone(vendor_tz)
 
         all_raw_date_slots = extract_slots_safely(raw_slots, date_str)
+        # Ensure slots are in chronological order
         all_raw_date_slots.sort(key=lambda x: x.get("time"))
 
         future_slots = []
         for s in all_raw_date_slots:
-            # Cal.com returns UTC 'Z' strings
+            # Cal.com returns UTC strings ending in 'Z'
             utc_dt = datetime.fromisoformat(s.get("time").replace('Z', '+00:00'))
             local_dt = utc_dt.astimezone(vendor_tz)
 
-            # Filter: Is this slot in the future?
-            if local_dt > (now_local + timedelta(minutes=30)):
+            # Trust Cal.com's availability. Only filter slots that are
+            # strictly in the past relative to the business's current time.
+            if local_dt > now_local:
                 s['display_time'] = local_dt.strftime("%I:%M %p")
                 future_slots.append(s)
 
         if not future_slots:
             return [], 0
 
+        # Smart windowing ensures we don't overwhelm the voice AI with 50 slots
         display_slots = get_smart_slots_window(future_slots, pref_time)
         return display_slots, len(future_slots)
 
     except Exception as e:
-        logger.error(f"Error in background slot processing: {e}")
+        logger.error(f"Error in slot processing: {e}")
         return [], 0
 
 
-def clean_vapi_email(raw_email: str):
-    if not raw_email:
+def utc_iso_to_ist_display(utc_iso: str) -> str:
+    dt_utc = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+    dt_ist = dt_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    return dt_ist.strftime("%A, %B %d at %I:%M %p IST")
+
+
+def utc_iso_to_tz_display(utc_iso: str, timezone_name: str) -> str:
+    """
+    Convert a UTC ISO string (Cal.com) into a readable time string
+    in the business timezone from DB.
+    """
+    if not utc_iso:
         return ""
 
-    cleaned = raw_email.lower().strip()
+    tz_name = timezone_name or "Asia/Kolkata"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = "Asia/Kolkata"
+        tz = ZoneInfo(tz_name)
 
-    # 1. Handle "the rate" variations specifically
-    # These often appear as "at the rate", "at therate", or just "therate"
-    cleaned = cleaned.replace("at the rate", "@")
-    cleaned = cleaned.replace("at therate", "@")
-    cleaned = cleaned.replace("attherate", "@")
-    cleaned = cleaned.replace("therate", "@")  # This fixes your specific error
+    # Cal.com uses 'Z' for UTC; datetime.fromisoformat needs '+00:00'
+    dt_utc = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+    dt_local = dt_utc.astimezone(tz)
 
-    # 2. If the transcriber already put a '@' in there
-    if "@" in cleaned:
-        cleaned = cleaned.replace(" dot ", ".")
-        cleaned = cleaned.replace(" ", "")
-    else:
-        # 3. No '@' found, handle standalone "at"
-        cleaned = cleaned.replace(" at ", "@")
-        cleaned = cleaned.replace(" dot ", ".")
-        cleaned = cleaned.replace(" ", "")
+    return dt_local.strftime(f"%A, %B %d %Y at %I:%M %p ({tz_name})")
 
-    # 4. Final cleanup for any missed 'dot' words and redundant '@'
-    cleaned = cleaned.replace("dot", ".")
 
-    # If the logic created "@@" (e.g., "at @"), fix it
-    while "@@" in cleaned:
-        cleaned = cleaned.replace("@@", "@")
+def clean_vapi_email(raw_email: str) -> str:
+    if not raw_email:
+        return ""
+    print(f"RAW uncleaned email from utils::--> {raw_email}")
+    normalized = raw_email.lower().strip()
 
-    return cleaned
+    # 1) Normalize common spoken separators first
+    normalized = normalized.replace("at the rate", "@")
+    normalized = normalized.replace("attherate", "@")
+    normalized = normalized.replace("at therate", "@")
+    normalized = normalized.replace("therate", "@")
+
+    # 2) Replace the word "dot" only (word boundary)
+    normalized = re.sub(r"\bdot\b", ".", normalized)
+
+    # 3) Remove all whitespace
+    normalized = re.sub(r"\s+", "", normalized)
+
+    # 4) Collapse multiple @
+    normalized = re.sub(r"@{2,}", "@", normalized)
+
+    # 5) Optional fallback: if still missing '@', replace ONLY the last 'at' token
+    if "@" not in normalized:
+        normalized = re.sub(r"(.*)\bat\b(.*)$", r"\1@\2", normalized)
+
+    print(f"cleaned email from utils::--> {normalized}")
+    return normalized
 
 
 # PRIVATE FUNCTIONS
